@@ -31,7 +31,7 @@ import seaborn as sns
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import torchvision.transforms as transforms
 from PIL import Image
@@ -69,12 +69,18 @@ OUTPUT_DIR = r"C:\Users\Reggie AugardSenft\gloria\output\BaselineA_output"
 SEED            = 42
 BATCH_SIZE      = 16
 NUM_EPOCHS      = 50
-LR              = 1e-3
+HEAD_LR         = 5e-4
+ENCODER_LR      = 5e-5
 WEIGHT_DECAY    = 1e-4
 NUM_WORKERS     = 0      # Windows 下建议 0
 NUM_CLASSES     = 5
 FREEZE_ENCODER  = True
+UNFREEZE_AT_EPOCH = 5
 VAL_SPLIT       = 0.15
+USE_BALANCED_SAMPLER = True
+LABEL_SMOOTHING = 0.05
+GRAD_CLIP_NORM  = 1.0
+MODEL_SELECTION_METRIC = "f1"  # 可选: "f1" / "auc"
 
 # CSV 原始标签 1-5 -> 模型输入标签 0-4
 # 请确认你自己的 CSV 标签定义和这里完全一致
@@ -169,7 +175,7 @@ class GLoRIAClassifier(nn.Module):
     def __init__(self, num_classes=5, freeze_encoder=True):
         super().__init__()
 
-        self.freeze_encoder = freeze_encoder
+        self.encoder_frozen = freeze_encoder
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # 加载 GLoRIA
@@ -177,14 +183,7 @@ class GLoRIAClassifier(nn.Module):
         self.encoder = gloria_model.img_encoder
 
         # 先按 freeze_encoder 决定参数是否训练
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-            self.encoder.eval()
-            print("✅ 编码器已冻结，并固定为 eval 模式")
-        else:
-            self.encoder.train()
-            print("✅ 编码器参与微调")
+        self.set_encoder_trainable(trainable=not freeze_encoder)
 
         # 动态推断 feature_dim
         feature_dim = self._infer_feature_dim(device)
@@ -197,6 +196,18 @@ class GLoRIAClassifier(nn.Module):
             nn.Linear(512, num_classes)
         )
 
+    def set_encoder_trainable(self, trainable: bool):
+        self.encoder_frozen = not trainable
+        for param in self.encoder.parameters():
+            param.requires_grad = trainable
+
+        if trainable:
+            self.encoder.train()
+            print("✅ 编码器参与微调")
+        else:
+            self.encoder.eval()
+            print("✅ 编码器已冻结，并固定为 eval 模式")
+
     def _infer_feature_dim(self, device):
         dummy = torch.zeros(1, 3, 224, 224).to(device)
 
@@ -206,7 +217,7 @@ class GLoRIAClassifier(nn.Module):
         with torch.no_grad():
             out = self.encoder(dummy)
 
-        if was_training and not self.freeze_encoder:
+        if was_training and not self.encoder_frozen:
             self.encoder.train()
 
         if isinstance(out, (tuple, list)):
@@ -221,7 +232,7 @@ class GLoRIAClassifier(nn.Module):
         return out.shape[1]
 
     def forward(self, x):
-        if self.freeze_encoder:
+        if self.encoder_frozen:
             # 冻结时禁用梯度 + 保持 eval 逻辑
             self.encoder.eval()
             with torch.no_grad():
@@ -246,7 +257,7 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
     model.train()
 
     # 关键：冻结 encoder 时，分类头 train，encoder eval
-    if model.freeze_encoder:
+    if model.encoder_frozen:
         model.encoder.eval()
 
     total_loss = 0.0
@@ -261,6 +272,8 @@ def train_one_epoch(model, loader, optimizer, criterion, device):
         outputs = model(images)
         loss = criterion(outputs, labels)
         loss.backward()
+        if GRAD_CLIP_NORM is not None and GRAD_CLIP_NORM > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP_NORM)
         optimizer.step()
 
         total_loss += loss.item()
@@ -333,6 +346,28 @@ def safe_per_class_auc(labels_bin, probs, class_names):
             print(f"⚠️ {name} 的 AUC 无法计算: {e}")
             results[name] = None
     return results
+
+
+def build_optimizer(model):
+    head_params = list(model.classifier.parameters())
+    encoder_params = [p for p in model.encoder.parameters() if p.requires_grad]
+
+    if len(encoder_params) == 0:
+        optimizer = optim.Adam(
+            head_params,
+            lr=HEAD_LR,
+            weight_decay=WEIGHT_DECAY
+        )
+    else:
+        optimizer = optim.Adam(
+            [
+                {'params': encoder_params, 'lr': ENCODER_LR},
+                {'params': head_params, 'lr': HEAD_LR}
+            ],
+            weight_decay=WEIGHT_DECAY
+        )
+
+    return optimizer
 
 
 # ============================================================
@@ -413,12 +448,15 @@ if __name__ == "__main__":
     label_counts = mapped_train_labels.value_counts().sort_index()
     total_samples = len(train_sub_df)
 
-    class_weights = torch.tensor(
+    raw_class_weights = torch.tensor(
         [total_samples / (NUM_CLASSES * label_counts.get(i, 1)) for i in range(NUM_CLASSES)],
         dtype=torch.float
-    ).to(device)
+    )
+    class_weights = torch.sqrt(raw_class_weights)
+    class_weights = class_weights / class_weights.mean()
+    class_weights = class_weights.to(device)
 
-    print(f"\n类别权重（inverse frequency）:")
+    print(f"\n类别权重（sqrt inverse frequency）:")
     for i, (name, w) in enumerate(zip(LABEL_NAMES, class_weights.cpu())):
         print(f"  {name:<20}: {float(w):.4f}  (样本数: {label_counts.get(i, 0)})")
 
@@ -429,13 +467,31 @@ if __name__ == "__main__":
     val_dataset   = CXRDataset(val_df,       IMAGE_ROOT, test_transform)
     test_dataset  = CXRDataset(test_df,      IMAGE_ROOT, test_transform)
 
-    train_loader = DataLoader(
-        train_dataset,
+    train_loader_kwargs = dict(
+        dataset=train_dataset,
         batch_size=BATCH_SIZE,
-        shuffle=True,
         num_workers=NUM_WORKERS,
         pin_memory=pin
     )
+
+    if USE_BALANCED_SAMPLER:
+        sample_weights = mapped_train_labels.map(lambda x: 1.0 / label_counts.get(x, 1)).astype(float).values
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(sample_weights, dtype=torch.double),
+            num_samples=len(sample_weights),
+            replacement=True
+        )
+        train_loader = DataLoader(
+            **train_loader_kwargs,
+            sampler=sampler,
+            shuffle=False
+        )
+        print("✅ 训练集使用 WeightedRandomSampler 做类别均衡采样")
+    else:
+        train_loader = DataLoader(
+            **train_loader_kwargs,
+            shuffle=True
+        )
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
@@ -472,17 +528,9 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     # 优化器 / 损失函数
     # --------------------------------------------------------
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=LABEL_SMOOTHING)
 
-    trainable_parameters = [p for p in model.parameters() if p.requires_grad]
-    if len(trainable_parameters) == 0:
-        raise RuntimeError("没有可训练参数，请检查 freeze_encoder 和分类头设置")
-
-    optimizer = optim.Adam(
-        trainable_parameters,
-        lr=LR,
-        weight_decay=WEIGHT_DECAY
-    )
+    optimizer = build_optimizer(model)
     scheduler = CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
 
     history = {
@@ -496,6 +544,7 @@ if __name__ == "__main__":
 
     # 关键：确保第一轮一定能保存 best model
     best_val_auc = -1.0
+    best_val_f1 = -1.0
     best_epoch = 0
     best_ckpt_path = os.path.join(OUTPUT_DIR, "checkpoints", "best_model.pth")
 
@@ -507,6 +556,12 @@ if __name__ == "__main__":
     # --------------------------------------------------------
     for epoch in range(NUM_EPOCHS):
         start = time.time()
+
+        if model.encoder_frozen and (not FREEZE_ENCODER or (epoch + 1) >= UNFREEZE_AT_EPOCH):
+            print(f"\n🔓 Epoch {epoch+1}: 解冻编码器并开始小学习率微调")
+            model.set_encoder_trainable(trainable=True)
+            optimizer = build_optimizer(model)
+            scheduler = CosineAnnealingLR(optimizer, T_max=(NUM_EPOCHS - epoch))
 
         train_loss, train_acc = train_one_epoch(
             model, train_loader, optimizer, criterion, device
@@ -528,9 +583,16 @@ if __name__ == "__main__":
         history['val_auc'].append(val_metrics['auc'])
         history['val_f1'].append(val_metrics['f1'])
 
-        # 第一轮一定保存；之后按 val_auc 提升保存
-        if epoch == 0 or val_metrics['auc'] > best_val_auc:
+        # 第一轮一定保存；之后按配置指标保存最优模型
+        metric_now = val_metrics['f1'] if MODEL_SELECTION_METRIC == "f1" else val_metrics['auc']
+        metric_best = best_val_f1 if MODEL_SELECTION_METRIC == "f1" else best_val_auc
+        improved = (metric_now > metric_best) or (
+            abs(metric_now - metric_best) < 1e-12 and val_metrics['auc'] > best_val_auc
+        )
+
+        if epoch == 0 or improved:
             best_val_auc = val_metrics['auc']
+            best_val_f1 = val_metrics['f1']
             best_epoch = epoch + 1
 
             torch.save({
@@ -538,13 +600,19 @@ if __name__ == "__main__":
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'best_val_auc': best_val_auc,
+                'best_val_f1': best_val_f1,
                 'val_metrics': val_metrics,
                 'config': {
                     'batch_size': BATCH_SIZE,
                     'num_epochs': NUM_EPOCHS,
-                    'lr': LR,
+                    'head_lr': HEAD_LR,
+                    'encoder_lr': ENCODER_LR,
                     'weight_decay': WEIGHT_DECAY,
                     'freeze_encoder': FREEZE_ENCODER,
+                    'unfreeze_at_epoch': UNFREEZE_AT_EPOCH,
+                    'use_balanced_sampler': USE_BALANCED_SAMPLER,
+                    'label_smoothing': LABEL_SMOOTHING,
+                    'model_selection_metric': MODEL_SELECTION_METRIC,
                     'val_split': VAL_SPLIT,
                     'seed': SEED
                 }
@@ -571,7 +639,11 @@ if __name__ == "__main__":
             )
 
     print("=" * 60)
-    print(f"训练完成！最佳验证集 AUC = {best_val_auc:.4f}（Epoch {best_epoch}）")
+    print(
+        f"训练完成！最佳模型来自 Epoch {best_epoch} | "
+        f"Val AUC={best_val_auc:.4f} | Val F1={best_val_f1:.4f} | "
+        f"选择指标={MODEL_SELECTION_METRIC}"
+    )
 
     # --------------------------------------------------------
     # 保存训练历史
@@ -594,6 +666,7 @@ if __name__ == "__main__":
 
     # 用 ckpt 中记录的 best_val_auc，避免和内存变量不一致
     best_val_auc = ckpt.get('best_val_auc', best_val_auc)
+    best_val_f1 = ckpt.get('best_val_f1', best_val_f1)
 
     _, test_labels, test_preds, test_probs = evaluate(
         model, test_loader, criterion, device
@@ -656,6 +729,7 @@ if __name__ == "__main__":
         'test_size': len(test_df),
         'best_epoch': ckpt.get('epoch', best_epoch),
         'best_val_auc': round(float(best_val_auc), 4) if best_val_auc is not None else None,
+        'best_val_f1': round(float(best_val_f1), 4) if best_val_f1 is not None else None,
         'class_weights': {
             n: round(float(w), 4) for n, w in zip(LABEL_NAMES, class_weights.cpu())
         },
